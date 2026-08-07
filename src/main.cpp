@@ -1,4 +1,5 @@
 #include "index.h"
+#include "secrets.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <DNSServer.h>
@@ -29,17 +30,9 @@ float historico[CAPACIDADE_HISTORICO]; // Buffer de histórico
 int indiceAtual = 0;                   // Índice atual do buffer de histórico
 bool bufferCheio = false;              // Flag para indicar se o buffer está cheio
 
-// CONFIGURAÇÕES DO BANCO DE DADOS TURSO (VALORES PADRÃO SE NÃO SALVO NA NVS)
-String turso_url =
-    "https://esppoco-olafotte.aws-us-east-1.turso.io/v2/pipeline";
-String turso_token =
-    "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9."
-    "eyJhIjoicnciLCJpYXQiOjE3ODMwMzQ0ODksImlkIjoiMDE5ZjI1MjItZjkwMS03NzFmLWEwNm"
-    "YtOTZiYjM0MGU5MWZiIiwia2lkIjoid0Y3WjExRUU3UHZwaVdrMTgzeVVsZlgtalFQNTZUMXBa"
-    "ZXRiai1vemYtUSIsInJpZCI6ImE2NWEyMzQxLTI1ZmQtNDk1Zi1hMTk3LWE3NDRmNzdhMTJkYi"
-    "J9.zk_"
-    "wrg7JjcNLgaP3ld0rsSBwSSViROqmBChPsqaspRq1vExHV5TbzqNAFFfyvl64X8nnnYiduIs1M"
-    "eN2Qqm0Aw";
+// CONFIGURAÇÕES DO BANCO DE DADOS TURSO (VALORES PADRÃO DE SECRETS.H)
+String turso_url = DEFAULT_TURSO_URL;
+String turso_token = DEFAULT_TURSO_TOKEN;
 
 // ESTRUTURAS DE SERVIDOR E PREFERENCES
 Preferences preferences;
