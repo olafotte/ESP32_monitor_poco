@@ -6,6 +6,9 @@ Sistema completo de telemetria e monitoramento do nível de água para poços e 
 ![PlatformIO](https://img.shields.io/badge/Framework-Arduino_PlatformIO-orange)
 ![Chart.js](https://img.shields.io/badge/Frontend-Chart.js-ff6384)
 ![Turso](https://img.shields.io/badge/Database-Turso_SQLite-4433ff)
+[![GitHub Repository](https://img.shields.io/badge/GitHub-ESP32__monitor__poco-181717?logo=github)](https://github.com/olafotte/ESP32_monitor_poco)
+
+> 🔗 **Repositório oficial no GitHub:** [https://github.com/olafotte/ESP32_monitor_poco](https://github.com/olafotte/ESP32_monitor_poco)
 
 ---
 

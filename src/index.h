@@ -79,6 +79,31 @@ const char index_html[] PROGMEM = R"=====(
           <span style="font-size:0.95rem; font-weight:bold;">🔊 Beep nas Leituras</span>
         </label>
       </div>
+      <div class="card">
+        <div class="label">Fila Offline</div>
+        <div class="value" id="valPendentes">0</div>
+        <div class="subvalue" id="subtextPendentes">Aguardando sincronização</div>
+      </div>
+      <div class="card">
+        <div class="label">Enviadas Turso (7d)</div>
+        <div class="value" id="valTurso7d" style="color:var(--accent-green);">0</div>
+        <div class="subvalue">Medições sincronizadas na nuvem</div>
+      </div>
+      <div class="card">
+        <div class="label">Salvas Offline (7d)</div>
+        <div class="value" id="valOffline7d" style="color:var(--accent-yellow);">0</div>
+        <div class="subvalue">Medições guardadas na Flash</div>
+      </div>
+      <div class="card" style="border: 1px dashed var(--accent-yellow);">
+        <div class="label">Teste de Sincronização</div>
+        <button id="btnSimularFalha" onclick="alternarSimulacaoFalha()" style="margin-top:8px; background:var(--accent-yellow); color:#000; font-weight:bold; border:none; padding:6px 10px; border-radius:6px; cursor:pointer; font-size:0.8rem; width:100%;">
+          🧪 Simular Queda do Turso
+        </button>
+        <button onclick="zerarTelemetriaWeb()" style="margin-top:6px; background:rgba(239, 68, 68, 0.2); color:var(--accent-red); border:1px solid var(--accent-red); font-weight:bold; padding:6px 10px; border-radius:6px; cursor:pointer; font-size:0.8rem; width:100%;">
+          🧹 Zerar Contadores e Fila
+        </button>
+        <div class="subvalue" id="statusSimulacao" style="margin-top:6px; font-size:0.75rem;">Modo Normal (Conectado)</div>
+      </div>
     </div>
 
     <div class="tank-container">
@@ -141,6 +166,48 @@ const char index_html[] PROGMEM = R"=====(
       }
     }
 
+    let estadoSimulacaoFalha = false;
+
+    async function alternarSimulacaoFalha() {
+      try {
+        const novoEstado = !estadoSimulacaoFalha;
+        await fetch('/simular_falha?ativo=' + (novoEstado ? '1' : '0'), { method: 'POST' });
+        atualizarUiSimulacao(novoEstado);
+      } catch (err) {
+        console.error("Erro ao alterar simulacao:", err);
+      }
+    }
+
+    function atualizarUiSimulacao(ativo) {
+      estadoSimulacaoFalha = ativo;
+      const btn = document.getElementById('btnSimularFalha');
+      const status = document.getElementById('statusSimulacao');
+      if (!btn || !status) return;
+      if (ativo) {
+        btn.style.background = 'var(--accent-red)';
+        btn.style.color = '#fff';
+        btn.innerText = '🔴 Parar Simulação';
+        status.innerText = '⚠️ SIMULANDO OFFLINE (Gravando na Flash)';
+        status.style.color = 'var(--accent-red)';
+      } else {
+        btn.style.background = 'var(--accent-yellow)';
+        btn.style.color = '#000';
+        btn.innerText = '🧪 Simular Queda do Turso';
+        status.innerText = 'Modo Normal (Conectado)';
+        status.style.color = 'var(--text-sub)';
+      }
+    }
+
+    async function zerarTelemetriaWeb() {
+      if (!confirm("Deseja realmente zerar a fila offline e todos os contadores de telemetria?")) return;
+      try {
+        await fetch('/zerar_telemetria', { method: 'POST' });
+        atualizarDados();
+      } catch (err) {
+        console.error("Erro ao zerar telemetria:", err);
+      }
+    }
+
     async function salvarParametrosWeb() {
       try {
         const tot = document.getElementById('cfgTotLeituras').value;
@@ -187,6 +254,19 @@ const char index_html[] PROGMEM = R"=====(
 
         document.getElementById('valPct').innerText = `${pct} %`;
         document.getElementById('valDist').innerText = `${dist} cm`;
+
+        const pendentes = dados.pendentes_offline !== undefined ? dados.pendentes_offline : 0;
+        const totalOffline = dados.total_salvas_offline !== undefined ? dados.total_salvas_offline : 0;
+        const totalTurso = dados.total_sincronizadas_turso !== undefined ? dados.total_sincronizadas_turso : 0;
+
+        document.getElementById('valPendentes').innerText = pendentes;
+        document.getElementById('subtextPendentes').innerText = pendentes > 0 ? "Aguardando reconexão Turso..." : "Tudo sincronizado";
+        document.getElementById('valTurso7d').innerText = totalTurso;
+        document.getElementById('valOffline7d').innerText = totalOffline;
+
+        if (dados.simular_falha !== undefined) {
+          atualizarUiSimulacao(dados.simular_falha);
+        }
 
         // Atualiza barra visual de nível
         const fillEl = document.getElementById('tankFill');

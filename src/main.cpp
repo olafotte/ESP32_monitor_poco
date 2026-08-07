@@ -5,10 +5,12 @@
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <HTTPClient.h>
+#include <LittleFS.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <time.h>
 
 // PINOS DO SENSOR ULTRASSÔNICO E PERIFÉRICOS
 const int trigPin = 25;
@@ -40,6 +42,285 @@ WebServer server(80);
 DNSServer dnsServer;
 bool tursoOk = false; // Status de integridade da conexão com a nuvem Turso
 bool setupConcluidoComSucesso = false; // Flag de trava síncrona do setup
+bool servidorWebIniciado = false;       // Flag para evitar inicializações duplicadas do Web Server
+bool simularFalhaConexao = false;      // Modo de teste: Simula queda de conexão Wi-Fi/Turso
+
+// CONTADORES E ESTRUTURA DE TELEMETRIA DESLIZANTE DE 7 DIAS (~32 BYTES NA NVS)
+uint16_t tursoDias[7] = {0};
+uint16_t offlineDias[7] = {0};
+uint32_t ultimoDiaEpoch = 0;
+
+void atualizarJanela7Dias() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return;
+  
+  uint32_t diaAtual = (uint32_t)(now / 86400);
+  if (ultimoDiaEpoch == 0) {
+    ultimoDiaEpoch = diaAtual;
+    return;
+  }
+  
+  if (diaAtual > ultimoDiaEpoch) {
+    uint32_t diasDecorridos = diaAtual - ultimoDiaEpoch;
+    if (diasDecorridos >= 7) {
+      for (int i = 0; i < 7; i++) {
+        tursoDias[i] = 0;
+        offlineDias[i] = 0;
+      }
+    } else {
+      for (size_t i = 0; i < 7 - diasDecorridos; i++) {
+        tursoDias[i] = tursoDias[i + diasDecorridos];
+        offlineDias[i] = offlineDias[i + diasDecorridos];
+      }
+      for (size_t i = 7 - diasDecorridos; i < 7; i++) {
+        tursoDias[i] = 0;
+        offlineDias[i] = 0;
+      }
+    }
+    ultimoDiaEpoch = diaAtual;
+  }
+}
+
+unsigned long obterTotalTurso7Dias() {
+  atualizarJanela7Dias();
+  unsigned long tot = 0;
+  for (int i = 0; i < 7; i++) tot += tursoDias[i];
+  return tot;
+}
+
+unsigned long obterTotalOffline7Dias() {
+  atualizarJanela7Dias();
+  unsigned long tot = 0;
+  for (int i = 0; i < 7; i++) tot += offlineDias[i];
+  return tot;
+}
+
+void registrarEnvioTurso7Dias(uint16_t qtd = 1) {
+  atualizarJanela7Dias();
+  tursoDias[6] += qtd;
+  
+  preferences.begin("telemetria7d", false);
+  preferences.putBytes("turso7d", tursoDias, sizeof(tursoDias));
+  preferences.putULong("lastDay", ultimoDiaEpoch);
+  preferences.end();
+}
+
+void registrarSalvoOffline7Dias() {
+  atualizarJanela7Dias();
+  offlineDias[6]++;
+  
+  preferences.begin("telemetria7d", false);
+  preferences.putBytes("off7d", offlineDias, sizeof(offlineDias));
+  preferences.putULong("lastDay", ultimoDiaEpoch);
+  preferences.end();
+}
+
+void carregarTelemetria7Dias() {
+  preferences.begin("telemetria7d", true);
+  preferences.getBytes("turso7d", tursoDias, sizeof(tursoDias));
+  preferences.getBytes("off7d", offlineDias, sizeof(offlineDias));
+  ultimoDiaEpoch = preferences.getULong("lastDay", 0);
+  preferences.end();
+  atualizarJanela7Dias();
+}
+
+// DECLARAÇÕES ANTECIPADAS DE SINALIZAÇÃO
+void sinalizarSucessoTurso();
+void sinalizarErroTurso();
+void sinalizarLeituraOffline();
+
+// ESTRUTURA E FUNÇÕES DE BUFFERING OFFLINE (LITTLEFS)
+struct RegistroOffline {
+  uint32_t timestamp; // Unix timestamp da medição
+  float nivel_cm;     // Distância medida em cm
+};
+
+const char *OFFLINE_FILE_PATH = "/offline_queue.dat";
+bool littleFSIniciado = false;
+
+void iniciarLittleFS() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("[LittleFS] ERRO: Falha ao inicializar o sistema de arquivos LittleFS!");
+    littleFSIniciado = false;
+  } else {
+    Serial.println("[LittleFS] Sistema de arquivos LittleFS montado com sucesso.");
+    littleFSIniciado = true;
+    // Cria o arquivo de fila vazio se não existir para evitar erros de leitura na VFS
+    if (!LittleFS.exists(OFFLINE_FILE_PATH)) {
+      File f = LittleFS.open(OFFLINE_FILE_PATH, "w");
+      if (f) f.close();
+    }
+  }
+}
+
+void zerarTelemetria7Dias() {
+  for (int i = 0; i < 7; i++) {
+    tursoDias[i] = 0;
+    offlineDias[i] = 0;
+  }
+  preferences.begin("telemetria7d", false);
+  preferences.putBytes("turso7d", tursoDias, sizeof(tursoDias));
+  preferences.putBytes("off7d", offlineDias, sizeof(offlineDias));
+  preferences.end();
+
+  if (littleFSIniciado) {
+    File f = LittleFS.open(OFFLINE_FILE_PATH, "w");
+    if (f) f.close();
+  }
+  Serial.println("[Telemetria] Contadores de telemetria e fila offline zerados.");
+}
+
+size_t obterQtdLeiturasOffline() {
+  if (!littleFSIniciado) return 0;
+  if (!LittleFS.exists(OFFLINE_FILE_PATH)) return 0;
+  File file = LittleFS.open(OFFLINE_FILE_PATH, "r");
+  if (!file) return 0;
+  size_t totalBytes = file.size();
+  file.close();
+  return totalBytes / sizeof(RegistroOffline);
+}
+
+bool salvarLeituraOffline(time_t ts, float nivel) {
+  if (!littleFSIniciado || nivel <= 0.0) return false;
+
+  File file = LittleFS.open(OFFLINE_FILE_PATH, "a");
+  if (!file) {
+    Serial.println("[LittleFS] ERRO: Não foi possível abrir o arquivo offline para gravação.");
+    return false;
+  }
+
+  RegistroOffline reg;
+  reg.timestamp = (uint32_t)ts;
+  reg.nivel_cm = nivel;
+
+  size_t bytesEscritos = file.write((uint8_t *)&reg, sizeof(RegistroOffline));
+  file.close();
+
+  if (bytesEscritos == sizeof(RegistroOffline)) {
+    registrarSalvoOffline7Dias();
+
+    Serial.printf("[LittleFS Buffer] Medição salva localmente: %.1f cm (TS: %u). Pendentes: %d (Total 7d Off: %lu)\n",
+                  nivel, (uint32_t)ts, (int)obterQtdLeiturasOffline(), obterTotalOffline7Dias());
+    sinalizarLeituraOffline();
+    return true;
+  } else {
+    Serial.println("[LittleFS Buffer] ERRO ao gravar registro na Flash.");
+    return false;
+  }
+}
+
+String formatarTimestampSQL(time_t ts) {
+  struct tm timeinfo;
+  localtime_r(&ts, &timeinfo);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+           timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+           timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  return String(buf);
+}
+
+bool descarregarFilaOfflineTurso() {
+  size_t totalPendentes = obterQtdLeiturasOffline();
+  if (totalPendentes == 0) return true;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  Serial.printf("[Turso Sync] Descarregando %d medições da fila offline...\n", (int)totalPendentes);
+
+  File file = LittleFS.open(OFFLINE_FILE_PATH, "r");
+  if (!file) {
+    Serial.println("[Turso Sync] ERRO ao abrir arquivo offline para leitura.");
+    return false;
+  }
+
+  const int BATCH_SIZE = 20;
+  RegistroOffline lotes[BATCH_SIZE];
+  int qtdLote = 0;
+
+  while (file.available() && qtdLote < BATCH_SIZE) {
+    if (file.read((uint8_t *)&lotes[qtdLote], sizeof(RegistroOffline)) == sizeof(RegistroOffline)) {
+      qtdLote++;
+    }
+  }
+  file.close();
+
+  if (qtdLote == 0) return true;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  if (!http.begin(client, turso_url)) {
+    Serial.println("[Turso Sync] ERRO ao iniciar cliente HTTP.");
+    return false;
+  }
+
+  http.setTimeout(8000);
+  http.addHeader("Content-Type", "application/json");
+  String authHeader = "Bearer " + turso_token;
+  http.addHeader("Authorization", authHeader);
+
+  JsonDocument doc;
+  JsonArray requests = doc["requests"].to<JsonArray>();
+
+  for (int i = 0; i < qtdLote; i++) {
+    JsonObject req = requests.add<JsonObject>();
+    req["type"] = "execute";
+    JsonObject stmt = req["stmt"].to<JsonObject>();
+
+    String querySql = "INSERT INTO leituras_poco (nivel_cm, status_bomba, timestamp) VALUES (";
+    querySql += String(lotes[i].nivel_cm, 2);
+    querySql += ", 'OFFLINE_SYNC', '";
+    querySql += formatarTimestampSQL((time_t)lotes[i].timestamp);
+    querySql += "');";
+
+    stmt["sql"] = querySql;
+  }
+
+  JsonObject reqClose = requests.add<JsonObject>();
+  reqClose["type"] = "close";
+
+  String requestBody;
+  serializeJson(doc, requestBody);
+
+  int httpCode = http.POST(requestBody);
+  String responseBody = http.getString();
+  http.end();
+
+  if (httpCode == 200 && responseBody.indexOf("\"error\"") == -1) {
+    registrarEnvioTurso7Dias((uint16_t)qtdLote);
+
+    Serial.printf("[Turso Sync] SUCESSO! Lote de %d leituras offline enviado. (Total 7d Turso: %lu)\n", qtdLote, obterTotalTurso7Dias());
+    sinalizarSucessoTurso();
+    tursoOk = true;
+
+    if (totalPendentes <= (size_t)qtdLote) {
+      File f = LittleFS.open(OFFLINE_FILE_PATH, "w");
+      if (f) f.close();
+      Serial.println("[Turso Sync] Fila offline zerada!");
+    } else {
+      File orig = LittleFS.open(OFFLINE_FILE_PATH, "r");
+      File temp = LittleFS.open("/offline_temp.dat", "w");
+      if (orig && temp) {
+        orig.seek(qtdLote * sizeof(RegistroOffline));
+        while (orig.available()) {
+          uint8_t buf[64];
+          size_t r = orig.read(buf, sizeof(buf));
+          temp.write(buf, r);
+        }
+        orig.close();
+        temp.close();
+        LittleFS.remove(OFFLINE_FILE_PATH);
+        LittleFS.rename("/offline_temp.dat", OFFLINE_FILE_PATH);
+      }
+    }
+    return true;
+  } else {
+    Serial.printf("[Turso Sync] ERRO HTTP (%d) ou Falha SQL. Resposta Turso: %s\n", httpCode, responseBody.c_str());
+    sinalizarErroTurso();
+    tursoOk = false;
+    return false;
+  }
+}
 
 // CONTROLE DE TEMPO NÃO-BLOQUEANTE
 unsigned long tempoAnteriorLeitura = 0;
@@ -134,6 +415,17 @@ void sinalizarErroTurso() {
   desativarSinal();
 }
 
+// 5.b Leitura Offline Salva na Flash: Tom duplo descendente suave (1800Hz -> 1200Hz)
+void sinalizarLeituraOffline() {
+  ativarSinal(1800);
+  delay(50);
+  desativarSinal();
+  delay(40);
+  ativarSinal(1200);
+  delay(70);
+  desativarSinal();
+}
+
 // 6. Reset NVS Executado pelo Botão: Varredura de queda livre de sistema
 // (3600Hz -> 400Hz)
 void sinalizarResetNVS() { varreduraFrequencia(3600, 400, 50); }
@@ -147,6 +439,88 @@ void tocarMusicaInicioSetup() {
     desativarSinal();
     delay(30);
   }
+}
+
+
+// Declaração antecipada da função getHistoricoJSON
+String getHistoricoJSON();
+
+void iniciarServidorWeb() {
+  if (servidorWebIniciado) return;
+
+  if (MDNS.begin("monitorpoco")) {
+    Serial.println("mDNS Ativo: http://monitorpoco.local");
+  }
+
+  server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", index_html); });
+  server.on("/dados", HTTP_GET, []() { server.send(200, "application/json", getHistoricoJSON()); });
+  server.on("/simular_falha", HTTP_POST, []() {
+    if (server.hasArg("ativo")) {
+      simularFalhaConexao = (server.arg("ativo") == "1" || server.arg("ativo") == "true");
+      Serial.printf("[Web Test] Simulação de Falha de Conexão: %s\n", simularFalhaConexao ? "ATIVADA (Simulando Offline)" : "DESATIVADA (Modo Normal)");
+      if (simularFalhaConexao) {
+        zerarTelemetria7Dias();
+      } else if (WiFi.status() == WL_CONNECTED && tursoOk) {
+        if (obterQtdLeiturasOffline() > 0) {
+          Serial.println("[Web Test] Restabelecendo conexão: Descarregando fila offline para o Turso...");
+          descarregarFilaOfflineTurso();
+        }
+      }
+      server.send(200, "application/json", "{\"sucesso\":true}");
+    } else {
+      server.send(400, "application/json", "{\"erro\":\"Parametro ausente\"}");
+    }
+  });
+  server.on("/zerar_telemetria", HTTP_POST, []() {
+    zerarTelemetria7Dias();
+    server.send(200, "application/json", "{\"sucesso\":true}");
+  });
+  server.on("/config_beep", HTTP_POST, []() {
+    if (server.hasArg("ativo")) {
+      habilitarBeepLeitura = (server.arg("ativo") == "1" || server.arg("ativo") == "true");
+      preferences.begin("system-config", false);
+      preferences.putBool("beep", habilitarBeepLeitura);
+      preferences.end();
+      Serial.printf("[Web Server] Beep alterado via Web: %s\n", habilitarBeepLeitura ? "LIGADO" : "DESLIGADO");
+      server.send(200, "application/json", "{\"sucesso\":true}");
+    } else {
+      server.send(400, "application/json", "{\"erro\":\"Parametro ausente\"}");
+    }
+  });
+  server.on("/config_parametros", HTTP_POST, []() {
+    preferences.begin("system-config", false);
+    if (server.hasArg("tot_leituras")) {
+      int v = server.arg("tot_leituras").toInt();
+      if (v >= 1 && v <= 20) { TOTAL_LEITURAS = v; preferences.putInt("tot_leituras", TOTAL_LEITURAS); }
+    }
+    if (server.hasArg("max_leituras")) {
+      int v = server.arg("max_leituras").toInt();
+      if (v >= 3 && v <= 50) {
+        MAX_LEITURAS = v;
+        preferences.putInt("max_leituras", MAX_LEITURAS);
+        indiceAtual = 0;
+        bufferCheio = false;
+      }
+    }
+    if (server.hasArg("int_leitura")) {
+      long v = server.arg("int_leitura").toInt();
+      if (v < 3) v = 3;
+      intervaloLeitura = v * 1000L;
+      preferences.putLong("int_leitura", intervaloLeitura);
+    }
+    if (server.hasArg("int_turso")) {
+      long v = server.arg("int_turso").toInt();
+      if (v >= 1) { intervaloTurso = v * 60000L; preferences.putLong("int_turso", intervaloTurso); }
+    }
+    preferences.end();
+    Serial.println("[Web Server] Parâmetros atualizados via Web!");
+    server.send(200, "application/json", "{\"sucesso\":true}");
+  });
+
+  server.begin();
+  servidorWebIniciado = true;
+  Serial.printf("[Web Server] Servidor HTTP pronto no IP %s! (Acesse http://%s)\n", 
+                WiFi.localIP().toString().c_str(), WiFi.localIP().toString().c_str());
 }
 
 // 8. Vinheta sonora de Fim do Setup / Sistema Pronto (Victory Fanfare: G5 - C6
@@ -368,6 +742,10 @@ String getHistoricoJSON() {
   doc["max_leituras"] = MAX_LEITURAS;
   doc["intervalo_leitura_s"] = intervaloLeitura / 1000;
   doc["intervalo_turso_m"] = intervaloTurso / 60000;
+  doc["pendentes_offline"] = obterQtdLeiturasOffline();
+  doc["total_salvas_offline"] = obterTotalOffline7Dias();
+  doc["total_sincronizadas_turso"] = obterTotalTurso7Dias();
+  doc["simular_falha"] = simularFalhaConexao;
 
   JsonArray arr = doc["historico_cm"].to<JsonArray>();
   int total = bufferCheio ? MAX_LEITURAS : indiceAtual;
@@ -383,22 +761,36 @@ String getHistoricoJSON() {
 
 // Envio HTTPS para o Turso (ArduinoJson v7)
 void enviarDadosTurso(float nivel) {
-  if (nivel == -1.0 || WiFi.status() != WL_CONNECTED)
+  if (nivel == -1.0) return;
+
+  if (WiFi.status() != WL_CONNECTED || !tursoOk || simularFalhaConexao) {
+    Serial.println("[Turso] Sem conexão ativa ou Simulação Ativa. Armazenando leitura no buffer offline...");
+    salvarLeituraOffline(time(nullptr), nivel);
     return;
+  }
+
+  // Tenta descarregar pendentes offline antes da medição atual
+  if (obterQtdLeiturasOffline() > 0) {
+    descarregarFilaOfflineTurso();
+  }
 
   WiFiClientSecure client;
   client.setInsecure();
 
   HTTPClient http;
   if (http.begin(client, turso_url)) {
+    http.setTimeout(4000);
     http.addHeader("Content-Type", "application/json");
     String authHeader = "Bearer " + turso_token;
     http.addHeader("Authorization", authHeader);
 
+    time_t agorats = time(nullptr);
     String querySql =
-        "INSERT INTO leituras_poco (nivel_cm, status_bomba) VALUES (";
+        "INSERT INTO leituras_poco (nivel_cm, status_bomba, timestamp) VALUES (";
     querySql += String(nivel, 2);
-    querySql += ", 'MONITORANDO');";
+    querySql += ", 'MONITORANDO', '";
+    querySql += formatarTimestampSQL(agorats);
+    querySql += "');";
 
     JsonDocument doc;
     JsonArray requests = doc["requests"].to<JsonArray>();
@@ -415,18 +807,24 @@ void enviarDadosTurso(float nivel) {
     serializeJson(doc, requestBody);
 
     int httpCode = http.POST(requestBody);
-    if (httpCode == 200) {
+    String responseBody = http.getString();
+
+    if (httpCode == 200 && responseBody.indexOf("\"error\"") == -1) {
+      registrarEnvioTurso7Dias(1);
+
       Serial.println("[Turso] SUCESSO: Leitura salva na nuvem com exito.");
       sinalizarSucessoTurso();
       tursoOk = true;
     } else {
-      Serial.printf("[Turso] ERRO HTTP (%d)\n", httpCode);
+      Serial.printf("[Turso] ERRO HTTP (%d) ou Falha SQL. Resposta Turso: %s\n", httpCode, responseBody.c_str());
       sinalizarErroTurso();
       tursoOk = false;
+      salvarLeituraOffline(agorats, nivel);
     }
     http.end();
   } else {
     tursoOk = false;
+    salvarLeituraOffline(time(nullptr), nivel);
   }
 }
 
@@ -442,6 +840,7 @@ bool testarConexaoTurso() {
 
   HTTPClient http;
   if (http.begin(client, turso_url)) {
+    http.setTimeout(4000);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("Authorization", "Bearer " + turso_token);
 
@@ -630,6 +1029,9 @@ void setup() {
   noTone(buzzerPin);
   pinMode(BOTAO_RESET_WIFI, INPUT_PULLUP);
 
+  // Inicializa o sistema de arquivos LittleFS para buffering offline
+  iniciarLittleFS();
+
   // Toca vinheta de inicialização do hardware
   tocarMusicaInicioSetup();
 
@@ -663,7 +1065,7 @@ void setup() {
   habilitarBeepLeitura = preferences.getBool("beep", false);
   intervaloLeitura = preferences.getLong("int_leitura", 10000L);
   if (intervaloLeitura < 3000L) {
-    intervaloLeitura = 3000L; // Piso de segurança: Mínimo 3 segundos para não travar o servidor web
+    intervaloLeitura = 3000L;
   }
   intervaloTurso = preferences.getLong("int_turso", 300000L);
   String savedToken = preferences.getString("token", "");
@@ -671,6 +1073,9 @@ void setup() {
     turso_token = savedToken;
   }
   preferences.end();
+  
+  // Carrega contadores de telemetria deslizante de 7 dias
+  carregarTelemetria7Dias();
 
   // 3. TENTATIVA DE CONEXÃO WI-FI
   if (ssid != "") {
@@ -681,7 +1086,7 @@ void setup() {
     WiFi.begin(ssid.c_str(), pass.c_str());
 
     int tentativas = 0;
-    while (WiFi.status() != WL_CONNECTED && tentativas < 30) {
+    while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
       delay(500);
       Serial.print(".");
       tentativas++;
@@ -694,83 +1099,26 @@ void setup() {
       configTime(0, 0, "pool.ntp.org", "time.nist.gov");
       time_t now = time(nullptr);
       int timeoutNTP = 0;
-      while (now < 8 * 3600 * 2 && timeoutNTP < 15) {
+      while (now < 8 * 3600 * 2 && timeoutNTP < 10) {
         delay(500);
         now = time(nullptr);
         timeoutNTP++;
       }
 
-      if (MDNS.begin("monitorpoco")) {
-        Serial.println("mDNS Ativo: http://monitorpoco.local");
-      }
-
-      server.on("/", HTTP_GET,
-                []() { server.send_P(200, "text/html", index_html); });
-      server.on("/dados", HTTP_GET, []() {
-        server.send(200, "application/json", getHistoricoJSON());
-      });
-      server.on("/config_beep", HTTP_POST, []() {
-        if (server.hasArg("ativo")) {
-          habilitarBeepLeitura =
-              (server.arg("ativo") == "1" || server.arg("ativo") == "true");
-          preferences.begin("system-config", false);
-          preferences.putBool("beep", habilitarBeepLeitura);
-          preferences.end();
-          Serial.printf(
-              "[Web Server] Beep de leitura alterado via Dashboard Web: %s\n",
-              habilitarBeepLeitura ? "LIGADO" : "DESLIGADO");
-          server.send(200, "application/json", "{\"sucesso\":true}");
-        } else {
-          server.send(400, "application/json",
-                      "{\"erro\":\"Parametro ausente\"}");
-        }
-      });
-      server.on("/config_parametros", HTTP_POST, []() {
-        preferences.begin("system-config", false);
-        if (server.hasArg("tot_leituras")) {
-          int v = server.arg("tot_leituras").toInt();
-          if (v >= 1 && v <= 20) { TOTAL_LEITURAS = v; preferences.putInt("tot_leituras", TOTAL_LEITURAS); }
-        }
-        if (server.hasArg("max_leituras")) {
-          int v = server.arg("max_leituras").toInt();
-          if (v >= 3 && v <= 50) {
-            MAX_LEITURAS = v;
-            preferences.putInt("max_leituras", MAX_LEITURAS);
-            indiceAtual = 0;
-            bufferCheio = false;
-          }
-        }
-        if (server.hasArg("int_leitura")) {
-          long v = server.arg("int_leitura").toInt();
-          if (v < 3) v = 3; // Piso mínimo 3s
-          intervaloLeitura = v * 1000L;
-          preferences.putLong("int_leitura", intervaloLeitura);
-        }
-        if (server.hasArg("int_turso")) {
-          long v = server.arg("int_turso").toInt();
-          if (v >= 1) { intervaloTurso = v * 60000L; preferences.putLong("int_turso", intervaloTurso); }
-        }
-        preferences.end();
-        Serial.println("[Web Server] Parâmetros de amostragem e tempo atualizados via Web!");
-        server.send(200, "application/json", "{\"sucesso\":true}");
-      });
-      server.begin();
-
+      iniciarServidorWeb();
       if (testarConexaoTurso()) {
         setupConcluidoComSucesso = true;
-        delay(500);
         tocarMusicaFimSetup();
         anunciarIpBuzzer();
-        Serial.println("[System] Setup concluído com SUCESSO! Transicionando "
-                       "para o loop.");
+        Serial.println("[System] Setup concluído com SUCESSO!");
+        if (obterQtdLeiturasOffline() > 0) {
+          descarregarFilaOfflineTurso();
+        }
       } else {
-        Serial.println("[System] Wi-Fi OK, mas falha no teste Turso. "
-                       "Aguardando validação para concluir setup...");
+        Serial.println("[System] Wi-Fi OK, mas Turso offline. Modo híbrido ativo.");
       }
-      return;
     } else {
-      Serial.println("\nFalha inicial de conexão Wi-Fi. Aguardando conexão "
-                     "para concluir o setup...");
+      Serial.println("\nFalha inicial de conexão Wi-Fi. Continuando monitoramento local e buffering offline...");
       sinalizarErroWifi();
     }
   }
@@ -782,90 +1130,62 @@ void setup() {
 }
 
 void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    iniciarServidorWeb();
+  }
   server.handleClient();
   unsigned long tempoAtual = millis();
 
-  // ============================================================================
-  // TRAVA SÍNCRONA DE SETUP: Bloqueia o loop até Wi-Fi + Turso estarem OK
-  // ============================================================================
-  if (!setupConcluidoComSucesso) {
-    if (WiFi.status() != WL_CONNECTED &&
-        (tempoAtual - tempoAnteriorReconexao >= intervaloReconexao)) {
-      tempoAnteriorReconexao = tempoAtual;
-      Serial.println(
-          "[Setup Incompleto] Tentando conectar/reconectar ao Wi-Fi...");
-      sinalizarErroWifi();
-      WiFi.reconnect();
-    } else if (WiFi.status() == WL_CONNECTED && !tursoOk &&
-               (tempoAtual - tempoAnteriorReconexao >= 10000)) {
-      tempoAnteriorReconexao = tempoAtual;
-      Serial.println("[Setup Incompleto] Wi-Fi OK. Validando conexão com a "
-                     "nuvem Turso...");
-      if (testarConexaoTurso()) {
-        setupConcluidoComSucesso = true;
-        tocarMusicaFimSetup();
-        anunciarIpBuzzer();
-        Serial.println("[System] Setup concluído com SUCESSO! Liberando loop "
-                       "de monitoramento.");
-      }
-    }
-    return; // TRAVA O LOOP: Nenhuma leitura ou envio ocorre até o Setup
-            // concluir com sucesso!
-  }
-
-  // ============================================================================
-  // LOOP PRINCIPAL DE MONITORAMENTO (Executado apenas após Setup OK)
-  // ============================================================================
-
-  // Reconexão Wi-Fi Assíncrona se cair durante a execução normal
+  // Reconexão Wi-Fi Assíncrona se desconectado
   if (WiFi.status() != WL_CONNECTED &&
       (tempoAtual - tempoAnteriorReconexao >= intervaloReconexao)) {
     tempoAnteriorReconexao = tempoAtual;
-    Serial.println(
-        "[Wi-Fi] Tentando reconectar à rede salva em segundo plano...");
+    Serial.println("[Wi-Fi] Tentando reconectar em segundo plano...");
     WiFi.reconnect();
   }
 
-  // Temporizador 1: Leitura Local do Sensor (A cada 10 segundos)
-  if (tempoAtual - tempoAnteriorLeitura >= intervaloLeitura) {
-    tempoAnteriorLeitura = tempoAtual;
-
-    // Checagem rigorosa de conexões: Aborta leituras se Wi-Fi ou Turso
-    // estiverem com problema
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[Leitura Abortada] Sem conexão Wi-Fi ativa.");
-      sinalizarErroWifi();
-    } else if (!tursoOk) {
-      Serial.println("[Leitura Abortada] Conexão com Turso indisponível. "
-                     "Tentando re-validar...");
-      sinalizarErroTurso();
-      testarConexaoTurso(); // Tenta re-validar o Turso para liberar leituras na
-                            // próxima rodada
-    } else {
-      float novaLeitura = lerDistanciaSemRessonancia();
-
-      if (novaLeitura == -1.0) {
-        Serial.println("Erro na leitura ultrassônica.");
-        sinalizarErroSensor();
-      } else {
-        adicionarLeitura(novaLeitura);
-        float pct = calcularPorcentagem(novaLeitura);
-        Serial.printf("Leitura Local: %.1f cm (Nível: %.1f%%)\n", novaLeitura,
-                      pct);
-        sinalizarBeepNivelProporcional(novaLeitura);
+  // Validação periódica do Turso e descarregamento da fila se reconectado
+  if (WiFi.status() == WL_CONNECTED && !tursoOk &&
+      (tempoAtual - tempoAnteriorReconexao >= 15000)) {
+    tempoAnteriorReconexao = tempoAtual;
+    if (testarConexaoTurso()) {
+      Serial.println("[Turso] Conexão restabelecida! Sincronizando fila...");
+      if (obterQtdLeiturasOffline() > 0) {
+        descarregarFilaOfflineTurso();
       }
     }
   }
 
-  // Temporizador 2: Envio para Nuvem Turso (A cada 5 minutos)
+  // Temporizador 1: Leitura Local do Sensor (Contínua, não aborta offline)
+  if (tempoAtual - tempoAnteriorLeitura >= intervaloLeitura) {
+    tempoAnteriorLeitura = tempoAtual;
+
+    float novaLeitura = lerDistanciaSemRessonancia();
+
+    if (novaLeitura == -1.0) {
+      Serial.println("Erro na leitura ultrassônica.");
+      sinalizarErroSensor();
+    } else {
+      adicionarLeitura(novaLeitura);
+      float pct = calcularPorcentagem(novaLeitura);
+      Serial.printf("Leitura Local: %.1f cm (Nível: %.1f%%)\n", novaLeitura, pct);
+      sinalizarBeepNivelProporcional(novaLeitura);
+    }
+  }
+
+  // Temporizador 2: Envio para Turso ou Buffering Offline (5 minutos padrão)
   if (tempoAtual - tempoAnteriorTurso >= intervaloTurso) {
     tempoAnteriorTurso = tempoAtual;
     float valorFiltrado = obterTerceiroMaiorDistanciaUltimas30();
 
     if (valorFiltrado != -1.0) {
-      Serial.printf("[Turso] Transmitindo leitura filtrada (5 min): %.1f cm\n",
-                    valorFiltrado);
-      enviarDadosTurso(valorFiltrado);
+      if (WiFi.status() == WL_CONNECTED && tursoOk && !simularFalhaConexao) {
+        Serial.printf("[Turso] Transmitindo leitura filtrada (5 min): %.1f cm\n", valorFiltrado);
+        enviarDadosTurso(valorFiltrado);
+      } else {
+        Serial.printf("[Offline Buffer] Guardando leitura na Flash (5 min): %.1f cm\n", valorFiltrado);
+        salvarLeituraOffline(time(nullptr), valorFiltrado);
+      }
     }
   }
 }
