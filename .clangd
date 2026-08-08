@@ -16,9 +16,33 @@ CompileFlags:
     - -isystem
     - C:/Users/olafo/.platformio/packages/toolchain-xtensa-esp32/xtensa-esp32-elf/include
     - -I
+    - C:/Users/olafo/.platformio/packages/framework-arduinoespressif32/cores/esp32
+    - -I
+    - C:/Users/olafo/.platformio/packages/framework-arduinoespressif32/variants/esp32
+    - -I
+    - C:/Users/olafo/.platformio/packages/framework-arduinoespressif32/libraries/ArduinoOTA/src
+    - -I
+    - C:/Users/olafo/.platformio/packages/framework-arduinoespressif32/libraries/DNSServer/src
+    - -I
+    - C:/Users/olafo/.platformio/packages/framework-arduinoespressif32/libraries/ESPmDNS/src
+    - -I
+    - C:/Users/olafo/.platformio/packages/framework-arduinoespressif32/libraries/HTTPClient/src
+    - -I
     - C:/Users/olafo/.platformio/packages/framework-arduinoespressif32/libraries/LittleFS/src
     - -I
     - C:/Users/olafo/.platformio/packages/framework-arduinoespressif32/libraries/FS/src
+    - -I
+    - C:/Users/olafo/.platformio/packages/framework-arduinoespressif32/libraries/Preferences/src
+    - -I
+    - C:/Users/olafo/.platformio/packages/framework-arduinoespressif32/libraries/Update/src
+    - -I
+    - C:/Users/olafo/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src
+    - -I
+    - C:/Users/olafo/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src
+    - -I
+    - C:/Users/olafo/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src
+    - -I
+    - C:/Testes/ESP32_monitor_poco/.pio/libdeps/esp32dev_cable/ArduinoJson/src
   Remove:
     - -mlongcalls
     - -fstrict-volatile-bitfields
@@ -27,6 +51,7 @@ CompileFlags:
     - -freorder-blocks
     - -Wno-error=unused-but-set-variable
     - -Wno-frame-address
+
 
 
 

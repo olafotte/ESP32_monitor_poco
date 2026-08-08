@@ -94,6 +94,11 @@ const char index_html[] PROGMEM = R"=====(
         <div class="value" id="valOffline7d" style="color:var(--accent-yellow);">0</div>
         <div class="subvalue">Medições guardadas na Flash</div>
       </div>
+      <div class="card" id="cardModoTurso" style="border: 1px solid var(--accent);">
+        <div class="label">Sample Rate Turso</div>
+        <div class="value" id="valModoTurso" style="font-size:1.3rem; margin:12px 0; color:var(--accent);">--</div>
+        <div class="subvalue" id="subtextModoTurso">Calculando amostragem...</div>
+      </div>
       <div class="card" style="border: 1px dashed var(--accent-yellow);">
         <div class="label">Teste de Sincronização</div>
         <button id="btnSimularFalha" onclick="alternarSimulacaoFalha()" style="margin-top:8px; background:var(--accent-yellow); color:#000; font-weight:bold; border:none; padding:6px 10px; border-radius:6px; cursor:pointer; font-size:0.8rem; width:100%;">
@@ -116,6 +121,7 @@ const char index_html[] PROGMEM = R"=====(
 
     <div class="chart-box">
       <h3>Histórico Recente de Distância (cm)</h3>
+      <div style="font-size:0.8rem; color:var(--text-sub); text-align:center; margin-bottom:10px;" id="subtextDerivada">Aguardando 12 leituras locais (2 min)...</div>
       <canvas id="graficoNivel"></canvas>
     </div>
 
@@ -135,8 +141,24 @@ const char index_html[] PROGMEM = R"=====(
           <input type="number" id="cfgIntLeitura" min="3" style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:#0f172a; color:#fff; margin-top:4px;">
         </div>
         <div>
-          <label style="font-size:0.8rem; color:var(--text-sub);">Intervalo Envio Turso (min)</label>
+          <label style="font-size:0.8rem; color:var(--text-sub);">Intervalo Turso Seco (min)</label>
           <input type="number" id="cfgIntTurso" min="1" style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:#0f172a; color:#fff; margin-top:4px;">
+        </div>
+        <div>
+          <label style="font-size:0.8rem; color:var(--text-sub);">Intervalo Turso Chuva (min)</label>
+          <input type="number" id="cfgIntTursoChuva" min="1" style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:#0f172a; color:#fff; margin-top:4px;">
+        </div>
+        <div>
+          <label style="font-size:0.8rem; color:var(--text-sub);">Limiar Subida Chuva (cm)</label>
+          <input type="number" step="0.1" id="cfgLimiarSubida" min="0.1" style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:#0f172a; color:#fff; margin-top:4px;">
+        </div>
+        <div>
+          <label style="font-size:0.8rem; color:var(--text-sub);">Cooldown Chuva (min)</label>
+          <input type="number" id="cfgCooldownChuva" min="1" style="width:100%; padding:8px; border-radius:6px; border:1px solid var(--border); background:#0f172a; color:#fff; margin-top:4px;">
+        </div>
+        <div style="grid-column: 1 / -1; display:flex; align-items:center; gap:10px; margin-top:5px;">
+          <input type="checkbox" id="chkModoDinamico" style="width:18px; height:18px; cursor:pointer; accent-color:#38bdf8;">
+          <label for="chkModoDinamico" style="font-size:0.85rem; color:var(--text-main); cursor:pointer; font-weight:bold;">🌧️ Ativar Sample Rate Autônomo (Alternar 1m/5m em chuva)</label>
         </div>
       </div>
       <div style="text-align:center; margin-top:15px;">
@@ -214,8 +236,12 @@ const char index_html[] PROGMEM = R"=====(
         const maxL = document.getElementById('cfgMaxLeituras').value;
         const intL = document.getElementById('cfgIntLeitura').value;
         const intT = document.getElementById('cfgIntTurso').value;
+        const intTChv = document.getElementById('cfgIntTursoChuva').value;
+        const limiar = document.getElementById('cfgLimiarSubida').value;
+        const cooldown = document.getElementById('cfgCooldownChuva').value;
+        const modoDin = document.getElementById('chkModoDinamico').checked ? '1' : '0';
 
-        const body = `tot_leituras=${tot}&max_leituras=${maxL}&int_leitura=${intL}&int_turso=${intT}`;
+        const body = `tot_leituras=${tot}&max_leituras=${maxL}&int_leitura=${intL}&int_turso=${intT}&int_turso_chuva=${intTChv}&limiar_subida=${limiar}&cooldown_chuva=${cooldown}&modo_dinamico=${modoDin}`;
         const res = await fetch('/config_parametros', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -245,7 +271,11 @@ const char index_html[] PROGMEM = R"=====(
           if (dados.total_leituras !== undefined) document.getElementById('cfgTotLeituras').value = dados.total_leituras;
           if (dados.max_leituras !== undefined) document.getElementById('cfgMaxLeituras').value = dados.max_leituras;
           if (dados.intervalo_leitura_s !== undefined) document.getElementById('cfgIntLeitura').value = dados.intervalo_leitura_s;
-          if (dados.intervalo_turso_m !== undefined) document.getElementById('cfgIntTurso').value = dados.intervalo_turso_m;
+          if (dados.intervalo_turso_seco_m !== undefined) document.getElementById('cfgIntTurso').value = dados.intervalo_turso_seco_m;
+          if (dados.intervalo_turso_chuva_m !== undefined) document.getElementById('cfgIntTursoChuva').value = dados.intervalo_turso_chuva_m;
+          if (dados.limiar_subida_cm !== undefined) document.getElementById('cfgLimiarSubida').value = dados.limiar_subida_cm;
+          if (dados.cooldown_chuva_m !== undefined) document.getElementById('cfgCooldownChuva').value = dados.cooldown_chuva_m;
+          if (dados.modo_dinamico_ativo !== undefined) document.getElementById('chkModoDinamico').checked = dados.modo_dinamico_ativo;
         }
 
         // Atualiza cards
@@ -263,6 +293,39 @@ const char index_html[] PROGMEM = R"=====(
         document.getElementById('subtextPendentes').innerText = pendentes > 0 ? "Aguardando reconexão Turso..." : "Tudo sincronizado";
         document.getElementById('valTurso7d').innerText = totalTurso;
         document.getElementById('valOffline7d').innerText = totalOffline;
+
+        // Atualiza Card de Sample Rate Turso
+        const valModoTurso = document.getElementById('valModoTurso');
+        const subtextModoTurso = document.getElementById('subtextModoTurso');
+        const cardModoTurso = document.getElementById('cardModoTurso');
+
+        if (dados.modo_chuva_ativo) {
+          const restS = dados.tempo_restante_cooldown_s || 0;
+          const minR = Math.floor(restS / 60);
+          const segR = restS % 60;
+          const tipo = dados.tipo_evento_dinamico || 1;
+          if (tipo === 2) {
+            valModoTurso.innerText = `⚡ Descida (${dados.intervalo_turso_chuva_m || 1} min)`;
+            valModoTurso.style.color = '#ef4444';
+            subtextModoTurso.innerText = `Bomba/Consumo • Cooldown: ${minR}m ${segR}s`;
+            cardModoTurso.style.borderColor = '#ef4444';
+          } else {
+            valModoTurso.innerText = `🌧️ Subida (${dados.intervalo_turso_chuva_m || 1} min)`;
+            valModoTurso.style.color = 'var(--accent-yellow)';
+            subtextModoTurso.innerText = `Chuva/Enxurrada • Cooldown: ${minR}m ${segR}s`;
+            cardModoTurso.style.borderColor = 'var(--accent-yellow)';
+          }
+        } else if (dados.modo_dinamico_ativo) {
+          valModoTurso.innerText = `☀️ Normal (${dados.intervalo_turso_seco_m || 5} min)`;
+          valModoTurso.style.color = 'var(--accent-green)';
+          subtextModoTurso.innerText = `Monitorando variações >= ${dados.limiar_subida_cm || 1} cm`;
+          cardModoTurso.style.borderColor = 'var(--border)';
+        } else {
+          valModoTurso.innerText = `⏱️ Fixo (${dados.intervalo_turso_m || 5} min)`;
+          valModoTurso.style.color = 'var(--text-sub)';
+          subtextModoTurso.innerText = `Modo autônomo desativado`;
+          cardModoTurso.style.borderColor = 'var(--border)';
+        }
 
         if (dados.simular_falha !== undefined) {
           atualizarUiSimulacao(dados.simular_falha);
@@ -288,9 +351,42 @@ const char index_html[] PROGMEM = R"=====(
           fillEl.style.background = 'linear-gradient(90deg, #0284c7, #38bdf8)';
         }
 
-        // Histórico para o gráfico
+        // Histórico para o gráfico e cálculo das médias da derivada
         const historico = dados.historico_cm || [];
         const labels = historico.map((_, index) => `#${index + 1}`);
+
+        // Média Recente (últimos 6 pontos = 1 min)
+        const mediaRecenteArr = historico.map((val, idx, arr) => {
+          if (idx < 5) return null;
+          let soma = 0, count = 0;
+          for (let k = idx - 5; k <= idx; k++) {
+            if (arr[k] > 0) { soma += arr[k]; count++; }
+          }
+          return count >= 4 ? parseFloat((soma / count).toFixed(1)) : null;
+        });
+
+        // Média Passada (6 pontos anteriores = 1-2 min atrás)
+        const mediaPassadaArr = historico.map((val, idx, arr) => {
+          if (idx < 11) return null;
+          let soma = 0, count = 0;
+          for (let k = idx - 11; k <= idx - 6; k++) {
+            if (arr[k] > 0) { soma += arr[k]; count++; }
+          }
+          return count >= 4 ? parseFloat((soma / count).toFixed(1)) : null;
+        });
+
+        // Atualiza subtexto da derivada acima do gráfico
+        const subtextDeriv = document.getElementById('subtextDerivada');
+        if (subtextDeriv && dados.media_recente_cm !== undefined && dados.media_passada_cm !== undefined) {
+          if (dados.media_recente_cm > 0 && dados.media_passada_cm > 0) {
+            const variacao = (dados.media_passada_cm - dados.media_recente_cm).toFixed(1);
+            const rotulo = variacao >= 0 ? `Subida: +${variacao}` : `Descida: ${variacao}`;
+            const corRotulo = variacao >= 0 ? '#38bdf8' : '#ef4444';
+            subtextDeriv.innerHTML = `Média Passada (1-2m): <b style="color:#eab308;">${dados.media_passada_cm.toFixed(1)} cm</b> &bull; Média Recente (1m): <b style="color:#22c55e;">${dados.media_recente_cm.toFixed(1)} cm</b> &bull; Variação: <b style="color:${corRotulo};">${rotulo} cm</b>`;
+          } else {
+            subtextDeriv.innerText = "Aguardando 12 leituras locais (2 min) para calcular a derivada...";
+          }
+        }
 
         if (!meuGrafico) {
           const ctx = document.getElementById('graficoNivel').getContext('2d');
@@ -298,15 +394,39 @@ const char index_html[] PROGMEM = R"=====(
             type: 'line',
             data: {
               labels: labels,
-              datasets: [{
-                label: 'Distância (cm)',
-                data: historico,
-                borderColor: '#38bdf8',
-                backgroundColor: 'rgba(56, 189, 248, 0.15)',
-                borderWidth: 2,
-                fill: true,
-                tension: 0.3
-              }]
+              datasets: [
+                {
+                  label: 'Leitura Instantânea (cm)',
+                  data: historico,
+                  borderColor: 'rgba(148, 163, 184, 0.35)',
+                  backgroundColor: 'transparent',
+                  borderWidth: 1.5,
+                  borderDash: [2, 2],
+                  pointRadius: 2,
+                  fill: false
+                },
+                {
+                  label: 'Média Recente (1 min)',
+                  data: mediaRecenteArr,
+                  borderColor: '#22c55e',
+                  backgroundColor: 'rgba(34, 197, 94, 0.08)',
+                  borderWidth: 2.5,
+                  pointRadius: 3,
+                  fill: true,
+                  tension: 0.3
+                },
+                {
+                  label: 'Média Passada (1-2 min atrás)',
+                  data: mediaPassadaArr,
+                  borderColor: '#eab308',
+                  backgroundColor: 'transparent',
+                  borderWidth: 2,
+                  borderDash: [5, 4],
+                  pointRadius: 3,
+                  fill: false,
+                  tension: 0.3
+                }
+              ]
             },
             options: {
               animation: false,
@@ -330,6 +450,8 @@ const char index_html[] PROGMEM = R"=====(
         } else {
           meuGrafico.data.labels = labels;
           meuGrafico.data.datasets[0].data = historico;
+          meuGrafico.data.datasets[1].data = mediaRecenteArr;
+          meuGrafico.data.datasets[2].data = mediaPassadaArr;
           meuGrafico.update();
         }
       } catch (error) {

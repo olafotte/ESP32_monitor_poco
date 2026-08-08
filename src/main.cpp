@@ -1,6 +1,7 @@
 #include "index.h"
 #include "secrets.h"
 #include <Arduino.h>
+#include <ArduinoOTA.h>
 #include <ArduinoJson.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
@@ -358,8 +359,98 @@ unsigned long tempoAnteriorLeitura = 0;
 long intervaloLeitura = 10000; // 10 segundos em milissegundos (padrão)
 
 unsigned long tempoAnteriorTurso = 0;
-long intervaloTurso =
-    300000; // 5 minutos (300 segundos) em milissegundos (padrão)
+long intervaloTursoSeco = 300000L;    // 5 minutos em ms (padrão seco)
+long intervaloTursoChuva = 60000L;    // 1 minuto em ms (padrão chuva)
+long intervaloTurso = 300000L;        // Intervalo ativo no momento (ms)
+
+float limiarSubidaCm = 1.0f;           // Subida mínima em cm para acionar Modo Chuva
+long tempoCooldownChuvaMs = 1800000L; // 30 minutos em ms
+bool modoDinamicoAtivo = true;        // Habilita/Desabilita amostragem autônoma por chuva
+
+// ESTADO DE TELEMETRIA DO MODO CHUVA / DINÂMICO
+bool modoChuvaAtivo = false;
+unsigned long ultimoEventoChuvaMs = 0;
+float distanciaReferenciaChuva = -1.0f;
+unsigned long tempoUltimaReferenciaChuva = 0;
+
+float ultimaMediaRecenteCm = -1.0f;
+float ultimaMediaPassadaCm = -1.0f;
+int tipoEventoDinamico = 0; // 0 = Estável, 1 = Subida (Chuva/Enxurrada), 2 = Descida (Bomba/Consumo)
+
+void avaliarTaxaSubidaEModoTurso(float novaLeitura) {
+  if (novaLeitura <= 0) return;
+  unsigned long tempoAtual = millis();
+
+  // Verifica se o buffer possui pelo menos 12 leituras para análise de 2 janelas de 6 pontos (2 minutos)
+  int totalDisponivel = bufferCheio ? MAX_LEITURAS : indiceAtual;
+  if (modoDinamicoAtivo && totalDisponivel >= 12) {
+    float somaRecente = 0.0f;
+    int qtdRecente = 0;
+    float somaPassada = 0.0f;
+    int qtdPassada = 0;
+
+    // Janela Recente: 6 amostras mais recentes (último 1 minuto)
+    for (int i = 0; i < 6; i++) {
+      int idx = (indiceAtual - 1 - i + MAX_LEITURAS) % MAX_LEITURAS;
+      if (historico[idx] > 0) {
+        somaRecente += historico[idx];
+        qtdRecente++;
+      }
+    }
+
+    // Janela Passada: 6 amostras anteriores (1 a 2 minutos atrás)
+    for (int i = 6; i < 12; i++) {
+      int idx = (indiceAtual - 1 - i + MAX_LEITURAS) % MAX_LEITURAS;
+      if (historico[idx] > 0) {
+        somaPassada += historico[idx];
+        qtdPassada++;
+      }
+    }
+
+    if (qtdRecente >= 4 && qtdPassada >= 4) {
+      float mediaRecente = somaRecente / qtdRecente;
+      float mediaPassada = somaPassada / qtdPassada;
+      ultimaMediaRecenteCm = mediaRecente;
+      ultimaMediaPassadaCm = mediaPassada;
+
+      // Variação absoluta (tanto subida quanto descida)
+      float variacaoAbs = fabsf(mediaPassada - mediaRecente);
+
+      if (variacaoAbs >= limiarSubidaCm) {
+        bool ehSubida = (mediaPassada > mediaRecente); // Menor distância = nível d'água subiu
+        tipoEventoDinamico = ehSubida ? 1 : 2;
+
+        if (!modoChuvaAtivo) {
+          Serial.printf("[Modo Dinâmico] %s CONFIRMADA (Janela 2 min)! Variação: %.2f cm (>= %.1f cm). Passada: %.1f cm -> Recente: %.1f cm. Intervalo Turso acelerado para %ld min.\n",
+                        ehSubida ? "SUBIDA DE NÍVEL (Chuva)" : "DESCIDA DE NÍVEL (Bomba/Consumo)",
+                        variacaoAbs, limiarSubidaCm, mediaPassada, mediaRecente, intervaloTursoChuva / 60000L);
+        }
+        modoChuvaAtivo = true;
+        ultimoEventoChuvaMs = tempoAtual;
+      }
+    }
+  }
+
+  // Verifica expiração do cooldown
+  if (modoDinamicoAtivo && modoChuvaAtivo) {
+    if (tempoAtual - ultimoEventoChuvaMs >= (unsigned long)tempoCooldownChuvaMs) {
+      modoChuvaAtivo = false;
+      tipoEventoDinamico = 0;
+      Serial.printf("[Modo Dinâmico] Cooldown de %ld min finalizado. Retornando ao intervalo padrão de %ld min.\n",
+                    tempoCooldownChuvaMs / 60000L, intervaloTursoSeco / 60000L);
+    }
+  } else if (!modoDinamicoAtivo) {
+    modoChuvaAtivo = false;
+    tipoEventoDinamico = 0;
+  }
+
+  // Atualiza o intervalo Turso ativo
+  if (modoDinamicoAtivo && modoChuvaAtivo) {
+    intervaloTurso = intervaloTursoChuva;
+  } else {
+    intervaloTurso = intervaloTursoSeco;
+  }
+}
 
 unsigned long tempoAnteriorReconexao = 0;
 const long intervaloReconexao = 30000; // 30 segundos
@@ -476,6 +567,48 @@ void tocarMusicaInicioSetup() {
 // Declaração antecipada da função getHistoricoJSON
 String getHistoricoJSON();
 
+bool otaIniciado = false;
+
+void iniciarArduinoOTA() {
+  if (otaIniciado)
+    return;
+
+  ArduinoOTA.setHostname("monitorpoco");
+
+  ArduinoOTA.onStart([]() {
+    String type =
+        (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
+    Serial.println("[ArduinoOTA] Iniciando atualização remota: " + type);
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println(
+        "\n[ArduinoOTA] Atualização concluída com SUCESSO! Reiniciando...");
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("[ArduinoOTA] Progresso: %u%%\r", (progress / (total / 100)));
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("[ArduinoOTA] ERRO [%u]: ", error);
+    if (error == OTA_AUTH_ERROR)
+      Serial.println("Falha de Autenticação");
+    else if (error == OTA_BEGIN_ERROR)
+      Serial.println("Falha no Início");
+    else if (error == OTA_CONNECT_ERROR)
+      Serial.println("Falha na Conexão");
+    else if (error == OTA_RECEIVE_ERROR)
+      Serial.println("Falha na Recepção");
+    else if (error == OTA_END_ERROR)
+      Serial.println("Falha no Fim");
+  });
+
+  ArduinoOTA.begin();
+  otaIniciado = true;
+  Serial.println("[ArduinoOTA] Servidor OTA ativo na porta 3232! (Hostname: monitorpoco.local)");
+}
+
 void iniciarServidorWeb() {
   if (servidorWebIniciado)
     return;
@@ -555,9 +688,34 @@ void iniciarServidorWeb() {
     if (server.hasArg("int_turso")) {
       long v = server.arg("int_turso").toInt();
       if (v >= 1) {
-        intervaloTurso = v * 60000L;
-        preferences.putLong("int_turso", intervaloTurso);
+        intervaloTursoSeco = v * 60000L;
+        preferences.putLong("int_turso", intervaloTursoSeco);
       }
+    }
+    if (server.hasArg("int_turso_chuva")) {
+      long v = server.arg("int_turso_chuva").toInt();
+      if (v >= 1) {
+        intervaloTursoChuva = v * 60000L;
+        preferences.putLong("int_turso_chv", intervaloTursoChuva);
+      }
+    }
+    if (server.hasArg("limiar_subida")) {
+      float v = server.arg("limiar_subida").toFloat();
+      if (v > 0.1f) {
+        limiarSubidaCm = v;
+        preferences.putFloat("limiar_subida", limiarSubidaCm);
+      }
+    }
+    if (server.hasArg("cooldown_chuva")) {
+      long v = server.arg("cooldown_chuva").toInt();
+      if (v >= 1) {
+        tempoCooldownChuvaMs = v * 60000L;
+        preferences.putLong("cooldown_chv", tempoCooldownChuvaMs);
+      }
+    }
+    if (server.hasArg("modo_dinamico")) {
+      modoDinamicoAtivo = (server.arg("modo_dinamico").toInt() == 1);
+      preferences.putBool("modo_din", modoDinamicoAtivo);
     }
     preferences.end();
     Serial.println("[Web Server] Parâmetros atualizados via Web!");
@@ -740,18 +898,24 @@ void adicionarLeitura(float valor) {
   }
 }
 
-// Retorna o 3º maior valor das últimas leituras para filtragem de oscilações
-float obterTerceiroMaiorDistanciaUltimas30() {
+// Retorna a distância filtrada adaptando a janela ao intervalo Turso ativo (1 min ou 5 min)
+float obterDistanciaFiltradaTurso() {
   int totalDisponivel = bufferCheio ? MAX_LEITURAS : indiceAtual;
   if (totalDisponivel < 3)
     return -1.0;
 
-  int limiteAnalise =
-      (totalDisponivel < MAX_LEITURAS) ? totalDisponivel : MAX_LEITURAS;
+  // Calcula quantas amostras locais cabem no intervalo Turso ativo (ex: 60s/10s = 6 amostras)
+  int amostrasDesejadas = (intervaloLeitura > 0) ? (intervaloTurso / intervaloLeitura) : 30;
+  if (amostrasDesejadas < 3)
+    amostrasDesejadas = 3;
+  if (amostrasDesejadas > totalDisponivel)
+    amostrasDesejadas = totalDisponivel;
+
   float amostras[50];
   int qtdAmostras = 0;
 
-  for (int i = 0; i < limiteAnalise; i++) {
+  // Pega apenas as 'amostrasDesejadas' mais recentes
+  for (int i = 0; i < amostrasDesejadas; i++) {
     int idx = (indiceAtual - 1 - i + MAX_LEITURAS) % MAX_LEITURAS;
     if (historico[idx] != -1.0) {
       amostras[qtdAmostras] = historico[idx];
@@ -773,7 +937,13 @@ float obterTerceiroMaiorDistanciaUltimas30() {
     }
   }
 
-  return amostras[qtdAmostras - 3]; // 3º Maior
+  // Janela pequena (ex: 6 amostras no modo 1 min) -> 2ª maior
+  // Janela grande (ex: 30 amostras no modo 5 min) -> 3ª maior
+  int offset = (qtdAmostras <= 10) ? 2 : 3;
+  if (qtdAmostras < offset)
+    offset = 1;
+
+  return amostras[qtdAmostras - offset];
 }
 
 // Resposta JSON limpa e estruturada via ArduinoJson v7
@@ -791,6 +961,23 @@ String getHistoricoJSON() {
   doc["max_leituras"] = MAX_LEITURAS;
   doc["intervalo_leitura_s"] = intervaloLeitura / 1000;
   doc["intervalo_turso_m"] = intervaloTurso / 60000;
+  doc["intervalo_turso_seco_m"] = intervaloTursoSeco / 60000;
+  doc["intervalo_turso_chuva_m"] = intervaloTursoChuva / 60000;
+  doc["limiar_subida_cm"] = limiarSubidaCm;
+  doc["cooldown_chuva_m"] = tempoCooldownChuvaMs / 60000;
+  doc["modo_dinamico_ativo"] = modoDinamicoAtivo;
+  doc["modo_chuva_ativo"] = modoChuvaAtivo;
+  doc["tipo_evento_dinamico"] = tipoEventoDinamico;
+  doc["media_recente_cm"] = ultimaMediaRecenteCm;
+  doc["media_passada_cm"] = ultimaMediaPassadaCm;
+  
+  unsigned long nowMs = millis();
+  long restanteCooldownS = 0;
+  if (modoChuvaAtivo && (nowMs - ultimoEventoChuvaMs < (unsigned long)tempoCooldownChuvaMs)) {
+    restanteCooldownS = (tempoCooldownChuvaMs - (nowMs - ultimoEventoChuvaMs)) / 1000L;
+  }
+  doc["tempo_restante_cooldown_s"] = restanteCooldownS;
+
   doc["pendentes_offline"] = obterQtdLeiturasOffline();
   doc["total_salvas_offline"] = obterTotalOffline7Dias();
   doc["total_sincronizadas_turso"] = obterTotalTurso7Dias();
@@ -980,9 +1167,29 @@ void iniciarPortalConfiguracao() {
             "name='int_leitura' value='" +
             String(intLeituraSeg) + "' min='3'>";
     html +=
-        "<label>Intervalo Envio Turso (minutos):</label><input type='number' "
+        "<label>Intervalo Turso Seco (minutos):</label><input type='number' "
         "name='int_turso' value='" +
-        String(intTursoMin) + "' min='1'>";
+        String(intervaloTursoSeco / 60000) + "' min='1'>";
+    html +=
+        "<label>Intervalo Turso Chuva (minutos):</label><input type='number' "
+        "name='int_turso_chuva' value='" +
+        String(intervaloTursoChuva / 60000) + "' min='1'>";
+    html +=
+        "<label>Limiar Subida p/ Chuva (cm):</label><input type='number' step='0.1' "
+        "name='limiar_subida' value='" +
+        String(limiarSubidaCm, 1) + "' min='0.1'>";
+    html +=
+        "<label>Cooldown Chuva (minutos):</label><input type='number' "
+        "name='cooldown_chuva' value='" +
+        String(tempoCooldownChuvaMs / 60000) + "' min='1'>";
+    html +=
+        "<label style='display:flex;align-items:center;gap:10px;margin:12px "
+        "0;cursor:pointer;'>"
+        "<input type='checkbox' name='modo_dinamico' value='1' "
+        "style='width:auto;margin:0;' " +
+        String(modoDinamicoAtivo ? "checked" : "") +
+        ">"
+        "<span>Ativar Sample Rate Autônomo (Modo Chuva)</span></label>";
     html +=
         "<label style='display:flex;align-items:center;gap:10px;margin:12px "
         "0;cursor:pointer;'>"
@@ -1013,6 +1220,10 @@ void iniciarPortalConfiguracao() {
     String reqMaxLeituras = server.arg("max_leituras");
     String reqIntLeitura = server.arg("int_leitura");
     String reqIntTurso = server.arg("int_turso");
+    String reqIntTursoChuva = server.arg("int_turso_chuva");
+    String reqLimiarSubida = server.arg("limiar_subida");
+    String reqCooldownChuva = server.arg("cooldown_chuva");
+    bool reqModoDinamico = server.hasArg("modo_dinamico");
     bool reqBeep = server.hasArg("beep");
 
     preferences.begin("system-config", false);
@@ -1033,9 +1244,25 @@ void iniciarPortalConfiguracao() {
     if (reqIntLeitura.length() > 0 && reqIntLeitura.toInt() >= 3)
       preferences.putLong("int_leitura", reqIntLeitura.toInt() * 1000L);
     else if (reqIntLeitura.length() > 0)
-      preferences.putLong("int_leitura", 3000L); // Piso de segurança mínimo 3s
-    if (reqIntTurso.length() > 0 && reqIntTurso.toInt() > 0)
-      preferences.putLong("int_turso", reqIntTurso.toInt() * 60000L);
+      preferences.putLong("int_leitura", 3000L);
+    if (reqIntTurso.length() > 0 && reqIntTurso.toInt() > 0) {
+      intervaloTursoSeco = reqIntTurso.toInt() * 60000L;
+      preferences.putLong("int_turso", intervaloTursoSeco);
+    }
+    if (reqIntTursoChuva.length() > 0 && reqIntTursoChuva.toInt() > 0) {
+      intervaloTursoChuva = reqIntTursoChuva.toInt() * 60000L;
+      preferences.putLong("int_turso_chv", intervaloTursoChuva);
+    }
+    if (reqLimiarSubida.length() > 0 && reqLimiarSubida.toFloat() > 0.1f) {
+      limiarSubidaCm = reqLimiarSubida.toFloat();
+      preferences.putFloat("limiar_subida", limiarSubidaCm);
+    }
+    if (reqCooldownChuva.length() > 0 && reqCooldownChuva.toInt() > 0) {
+      tempoCooldownChuvaMs = reqCooldownChuva.toInt() * 60000L;
+      preferences.putLong("cooldown_chv", tempoCooldownChuvaMs);
+    }
+    modoDinamicoAtivo = reqModoDinamico;
+    preferences.putBool("modo_din", modoDinamicoAtivo);
     preferences.putBool("beep", reqBeep);
     preferences.end();
 
@@ -1125,7 +1352,12 @@ void setup() {
   if (intervaloLeitura < 3000L) {
     intervaloLeitura = 3000L;
   }
-  intervaloTurso = preferences.getLong("int_turso", 300000L);
+  intervaloTursoSeco = preferences.getLong("int_turso", 300000L);
+  intervaloTursoChuva = preferences.getLong("int_turso_chv", 60000L);
+  limiarSubidaCm = preferences.getFloat("limiar_subida", 1.0f);
+  tempoCooldownChuvaMs = preferences.getLong("cooldown_chv", 1800000L);
+  modoDinamicoAtivo = preferences.getBool("modo_din", true);
+  intervaloTurso = modoDinamicoAtivo && modoChuvaAtivo ? intervaloTursoChuva : intervaloTursoSeco;
   String savedToken = preferences.getString("token", "");
   if (savedToken.length() > 0) {
     turso_token = savedToken;
@@ -1192,6 +1424,8 @@ void setup() {
 void loop() {
   if (WiFi.status() == WL_CONNECTED) {
     iniciarServidorWeb();
+    iniciarArduinoOTA();
+    ArduinoOTA.handle();
   }
   server.handleClient();
   unsigned long tempoAtual = millis();
@@ -1231,24 +1465,26 @@ void loop() {
       Serial.printf("Leitura Local: %.1f cm (Nível: %.1f%%)\n", novaLeitura,
                     pct);
       sinalizarBeepNivelProporcional(novaLeitura);
+      avaliarTaxaSubidaEModoTurso(novaLeitura);
     }
   }
 
-  // Temporizador 2: Envio para Turso ou Buffering Offline (5 minutos padrão)
-  if (tempoAtual - tempoAnteriorTurso >= intervaloTurso) {
+  // Temporizador 2: Envio para Turso ou Buffering Offline (Dinamico: 1 min em chuva / 5 min seco)
+  if (tempoAtual - tempoAnteriorTurso >= (unsigned long)intervaloTurso) {
     tempoAnteriorTurso = tempoAtual;
-    float valorFiltrado = obterTerceiroMaiorDistanciaUltimas30();
+    float valorFiltrado = obterDistanciaFiltradaTurso();
 
     if (valorFiltrado != -1.0) {
+      long intMin = intervaloTurso / 60000L;
       if (WiFi.status() == WL_CONNECTED && tursoOk && !simularFalhaConexao) {
         Serial.printf(
-            "[Turso] Transmitindo leitura filtrada (5 min): %.1f cm\n",
-            valorFiltrado);
+            "[Turso] Transmitindo leitura filtrada (%ld min): %.1f cm\n",
+            intMin, valorFiltrado);
         enviarDadosTurso(valorFiltrado);
       } else {
         Serial.printf(
-            "[Offline Buffer] Guardando leitura na Flash (5 min): %.1f cm\n",
-            valorFiltrado);
+            "[Offline Buffer] Guardando leitura na Flash (%ld min): %.1f cm\n",
+            intMin, valorFiltrado);
         salvarLeituraOffline(time(nullptr), valorFiltrado);
       }
     }
