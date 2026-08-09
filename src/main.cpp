@@ -197,6 +197,38 @@ size_t obterQtdLeiturasOffline() {
   return totalBytes / sizeof(RegistroOffline);
 }
 
+const long GMT_OFFSET_SEC = -3 * 3600; // Horário de Brasília (UTC-3)
+const int DAYLIGHT_OFFSET_SEC = 0;
+
+bool testarEAtualizarNTP(int timeoutMs = 3000) {
+  if (WiFi.status() != WL_CONNECTED)
+    return false;
+
+  time_t now = time(nullptr);
+  if (now >= 1700000000) {
+    return true; // Relógio do sistema já está sincronizado
+  }
+
+  Serial.println("[NTP] Horário do sistema não sincronizado (< 1700000000). Solicitando sincronização NTP...");
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, "a.st1.ntp.br", "b.st1.ntp.br", "pool.ntp.org");
+
+  unsigned long start = millis();
+  while (millis() - start < (unsigned long)timeoutMs) {
+    delay(100);
+    now = time(nullptr);
+    if (now >= 1700000000) {
+      struct tm timeinfo;
+      localtime_r(&now, &timeinfo);
+      Serial.printf("[NTP] SUCESSO! Horário do sistema sincronizado: %04d-%02d-%02d %02d:%02d:%02d (UTC-3)\n",
+                    timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                    timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+      return true;
+    }
+  }
+  Serial.println("[NTP] ALERTA: Servidor NTP não respondeu no tempo limite.");
+  return false;
+}
+
 bool salvarLeituraOffline(time_t ts, float nivel) {
   if (!littleFSIniciado || nivel <= 0.0)
     return false;
@@ -209,7 +241,12 @@ bool salvarLeituraOffline(time_t ts, float nivel) {
   }
 
   RegistroOffline reg;
-  reg.timestamp = (uint32_t)ts;
+  // Se o relógio não estiver sincronizado (ts < 1700000000), grava o tempo de uptime em segundos (millis() / 1000)
+  if (ts >= 1700000000) {
+    reg.timestamp = (uint32_t)ts;
+  } else {
+    reg.timestamp = (uint32_t)(millis() / 1000);
+  }
   reg.nivel_cm = nivel;
 
   size_t bytesEscritos = file.write((uint8_t *)&reg, sizeof(RegistroOffline));
@@ -218,10 +255,9 @@ bool salvarLeituraOffline(time_t ts, float nivel) {
   if (bytesEscritos == sizeof(RegistroOffline)) {
     registrarSalvoOffline7Dias();
 
-    Serial.printf("[LittleFS Buffer] Medição salva localmente: %.1f cm (TS: "
-                  "%u). Pendentes: %d (Total 7d Off: %lu)\n",
-                  nivel, (uint32_t)ts, (int)obterQtdLeiturasOffline(),
-                  obterTotalOffline7Dias());
+    Serial.printf("[LittleFS Buffer] Medição salva localmente: %.1f cm (TS: %u [%s]). Pendentes: %d (Total 7d Off: %lu)\n",
+                  nivel, reg.timestamp, (ts >= 1700000000) ? "Real" : "Uptime Relativo",
+                  (int)obterQtdLeiturasOffline(), obterTotalOffline7Dias());
     sinalizarLeituraOffline();
     return true;
   } else {
@@ -247,8 +283,15 @@ bool descarregarFilaOfflineTurso() {
   if (WiFi.status() != WL_CONNECTED)
     return false;
 
-  Serial.printf("[Turso Sync] Descarregando %d medições da fila offline...\n",
-                (int)totalPendentes);
+  // Garante que o NTP esteja sincronizado antes de descarregar a fila
+  testarEAtualizarNTP(2000);
+  time_t agorats = time(nullptr);
+  uint32_t realNow = (agorats >= 1700000000) ? (uint32_t)agorats : 0;
+  uint32_t uptimeSec = (uint32_t)(millis() / 1000);
+  uint32_t bootEpoch = (realNow > uptimeSec) ? (realNow - uptimeSec) : 0;
+
+  Serial.printf("[Turso Sync] Descarregando %d medições da fila offline (BootEpoch: %u)...\n",
+                (int)totalPendentes, bootEpoch);
 
   File file = LittleFS.open(OFFLINE_FILE_PATH, "r");
   if (!file) {
@@ -293,11 +336,20 @@ bool descarregarFilaOfflineTurso() {
     req["type"] = "execute";
     JsonObject stmt = req["stmt"].to<JsonObject>();
 
+    time_t tsFinal;
+    if (lotes[i].timestamp >= 1700000000) {
+      tsFinal = (time_t)lotes[i].timestamp;
+    } else if (bootEpoch > 0) {
+      tsFinal = (time_t)(bootEpoch + lotes[i].timestamp);
+    } else {
+      tsFinal = (agorats >= 1700000000) ? agorats : (time_t)lotes[i].timestamp;
+    }
+
     String querySql = "INSERT INTO leituras_poco (nivel_cm, status_bomba, "
                       "timestamp) VALUES (";
     querySql += String(lotes[i].nivel_cm, 2);
     querySql += ", 'OFFLINE_SYNC', '";
-    querySql += formatarTimestampSQL((time_t)lotes[i].timestamp);
+    querySql += formatarTimestampSQL(tsFinal);
     querySql += "');";
 
     stmt["sql"] = querySql;
@@ -954,6 +1006,9 @@ String getHistoricoJSON() {
           ? historico[(indiceAtual - 1 + MAX_LEITURAS) % MAX_LEITURAS]
           : -1.0;
 
+  time_t tNow = time(nullptr);
+  doc["ntp_ok"] = (tNow >= 1700000000);
+  doc["timestamp_atual"] = (tNow >= 1700000000) ? formatarTimestampSQL(tNow) : "Invalido (NTP Pendente)";
   doc["distancia_cm"] = ultimaDist;
   doc["nivel_pct"] = calcularPorcentagem(ultimaDist);
   doc["beep_ativo"] = habilitarBeepLeitura;
@@ -1007,6 +1062,20 @@ void enviarDadosTurso(float nivel) {
     return;
   }
 
+  // Tenta garantir que o relógio esteja sincronizado antes de enviar dados em tempo real
+  time_t agorats = time(nullptr);
+  if (agorats < 1700000000) {
+    testarEAtualizarNTP(2000);
+    agorats = time(nullptr);
+  }
+
+  // Se o relógio ainda for inválido, guarda no buffer offline para não enviar data 1970 ao banco
+  if (agorats < 1700000000) {
+    Serial.println("[Turso] ALERTA: Relógio NTP não sincronizado. Armazenando no buffer offline para preservar timestamp.");
+    salvarLeituraOffline(agorats, nivel);
+    return;
+  }
+
   // Tenta descarregar pendentes offline antes da medição atual
   if (obterQtdLeiturasOffline() > 0) {
     descarregarFilaOfflineTurso();
@@ -1022,7 +1091,6 @@ void enviarDadosTurso(float nivel) {
     String authHeader = "Bearer " + turso_token;
     http.addHeader("Authorization", authHeader);
 
-    time_t agorats = time(nullptr);
     String querySql = "INSERT INTO leituras_poco (nivel_cm, status_bomba, "
                       "timestamp) VALUES (";
     querySql += String(nivel, 2);
@@ -1386,14 +1454,7 @@ void setup() {
       Serial.println("\nWi-Fi Conectado com Sucesso!");
       sinalizarSucessoWifi();
 
-      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-      time_t now = time(nullptr);
-      int timeoutNTP = 0;
-      while (now < 8 * 3600 * 2 && timeoutNTP < 10) {
-        delay(500);
-        now = time(nullptr);
-        timeoutNTP++;
-      }
+      testarEAtualizarNTP(4000);
 
       iniciarServidorWeb();
       if (testarConexaoTurso()) {
@@ -1436,6 +1497,13 @@ void loop() {
     tempoAnteriorReconexao = tempoAtual;
     Serial.println("[Wi-Fi] Tentando reconectar em segundo plano...");
     WiFi.reconnect();
+  }
+
+  // Tentativa periódica de sincronizar relógio NTP se Wi-Fi estiver conectado mas horário inválido
+  if (WiFi.status() == WL_CONNECTED && time(nullptr) < 1700000000 &&
+      (tempoAtual - tempoAnteriorReconexao >= 10000)) {
+    tempoAnteriorReconexao = tempoAtual;
+    testarEAtualizarNTP(2000);
   }
 
   // Validação periódica do Turso e descarregamento da fila se reconectado
