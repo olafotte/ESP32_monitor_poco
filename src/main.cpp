@@ -197,7 +197,7 @@ size_t obterQtdLeiturasOffline() {
   return totalBytes / sizeof(RegistroOffline);
 }
 
-const long GMT_OFFSET_SEC = -3 * 3600; // Horário de Brasília (UTC-3)
+const long GMT_OFFSET_SEC = 0; // Horário UTC / Greenwich (UTC+0)
 const int DAYLIGHT_OFFSET_SEC = 0;
 
 bool testarEAtualizarNTP(int timeoutMs = 3000) {
@@ -218,8 +218,8 @@ bool testarEAtualizarNTP(int timeoutMs = 3000) {
     now = time(nullptr);
     if (now >= 1700000000) {
       struct tm timeinfo;
-      localtime_r(&now, &timeinfo);
-      Serial.printf("[NTP] SUCESSO! Horário do sistema sincronizado: %04d-%02d-%02d %02d:%02d:%02d (UTC-3)\n",
+      gmtime_r(&now, &timeinfo);
+      Serial.printf("[NTP] SUCESSO! Horário do sistema sincronizado: %04d-%02d-%02d %02d:%02d:%02d (UTC / Greenwich)\n",
                     timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                     timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
       return true;
@@ -268,7 +268,7 @@ bool salvarLeituraOffline(time_t ts, float nivel) {
 
 String formatarTimestampSQL(time_t ts) {
   struct tm timeinfo;
-  localtime_r(&ts, &timeinfo);
+  gmtime_r(&ts, &timeinfo);
   char buf[32];
   snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
            timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
